@@ -5,8 +5,11 @@ import {
 } from "@anthropic-ai/sdk/resources/messages/messages.mjs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import readline from "readline/promises";
-import dotenv from "dotenv";
+import * as readline from "readline/promises";
+import * as dotenv from "dotenv";
+import {spawn} from "child_process";
+import * as fs from "fs";
+import * as path from "path";
 
 dotenv.config();
 
@@ -20,6 +23,9 @@ class MCPClient {
   private anthropic: Anthropic;
   private transport: StdioClientTransport | null = null;
   private tools: Tool[] = [];
+  private isRec: boolean = false;
+  private recordProcess: any = null;
+  private tempAudioFile: string = path.join(process.cwd(), "temp_audio.wav");
 
   constructor() {
     this.anthropic = new Anthropic({
@@ -119,6 +125,118 @@ class MCPClient {
     return finalText.join("\n");
   }
 
+  startRecording() {
+    console.log("Current working directory:", process.cwd());
+    if (this.isRec) {
+      console.log("Already recording...");
+      return;
+    }
+
+    console.log("Recording... Press Ctrl+C to stop recording.");
+    this.isRec = true;
+    
+    try {
+      this.recordProcess = spawn("sox", [
+        "-V",
+        "-d", // Use default audio device
+        "-b", "16",
+        "-r", "16000", // Sample rate
+        "-c", "1", // Mono channel
+        "-e", "signed-integer",
+        "-t", "wav",
+        "--no-dither",
+        this.tempAudioFile,
+        "trim", "0", "5"
+      ]);
+
+      this.recordProcess.stderr.on("data", (data: Buffer) => {
+        console.error(`Recording Error: ${data}`);
+      });
+
+    } catch (error) {
+      console.error("Error starting recording:", error);
+      this.isRec = false;
+    }
+  }
+
+  stopRecording(): Promise<void> {
+    return new Promise((resolve) => {
+      if (!this.isRec || !this.recordProcess) {
+        resolve();
+        return;
+      }
+
+      console.log("Stopping recording...");
+      this.isRec = false;
+
+      this.recordProcess.kill('SIGINT');
+
+      // Wait for process to end
+      this.recordProcess.on("close", () => {
+        console.log("Recording stopped. Transcribing...");
+        resolve();
+      });
+    });
+  }
+
+  async transcribeAudio(): Promise<string> {
+    console.log("in transcription");
+    try {
+      // Check if file exists
+      if (!fs.existsSync(this.tempAudioFile)) {
+        throw new Error("Audio file not found");
+      }
+
+      // Using Google Cloud Speech-to-Text API via curl
+      // Note: In a production environment, you should use the official SDK
+      // This example assumes you have your Google Cloud credentials set up
+      
+      console.log("Transcribing audio...");
+      
+      const transcribeProcess = spawn("python3", [
+        "transcribe_local.py",   // Python script we created
+        this.tempAudioFile
+      ]);
+  
+      let outputData = "";
+      let errorData = "";
+  
+      transcribeProcess.stdout.on("data", (data) => {
+        outputData += data.toString();
+      });
+
+      transcribeProcess.stderr.on("data", (data) => {
+        errorData += data.toString();
+      });
+  
+      return new Promise((resolve, reject) => {
+        transcribeProcess.on("close", (code) => {
+          if (code !== 0) {
+            console.error("Whisper error output:", errorData);
+            reject(new Error(`Local transcription process exited with code ${code}`));
+            return;
+          }
+  
+          try {
+            resolve(outputData.trim());
+          } catch (e) {
+            reject(new Error("Failed to parse local transcription output"));
+          } finally {
+            // Clean up the temporary audio file
+            fs.unlinkSync(this.tempAudioFile);
+          }
+        });
+      });
+    } catch (error) {
+      console.error("Transcription error:", error);
+      // Clean up if possible
+      if (fs.existsSync(this.tempAudioFile)) {
+        fs.unlinkSync(this.tempAudioFile);
+      }
+      return "";
+    }
+  }
+
   async chatLoop() {
     const rl = readline.createInterface({
       input: process.stdin,
@@ -130,12 +248,30 @@ class MCPClient {
       console.log("Type your queries or 'quit' to exit.");
 
       while (true) {
-        const message = await rl.question("\nQuery: ");
-        if (message.toLowerCase() === "quit") {
+        const command = await rl.question("\nCommand/Query: ");
+        if (command.toLowerCase() === "quit") {
           break;
         }
-        const response = await this.processQuery(message);
-        console.log("\n" + response);
+        else if (command.toLowerCase() === "voice") {
+          this.startRecording();
+
+          await rl.question("\nPlease Enter to Stop Recording...");
+          console.log("1");
+          await this.stopRecording();
+          console.log("2");
+          const transcribedText = await this.transcribeAudio();
+
+          if (transcribedText) {
+            console.log(`Transcribed: "${transcribedText}"`);
+            const response = await this.processQuery(transcribedText);
+            console.log("\n" + response); 
+          } else {
+            console.log("Transcription failed")
+          }
+        } else {
+          const response = await this.processQuery(command);
+          console.log("\n" + response);
+        }
       }
     } finally {
       rl.close();
@@ -143,7 +279,14 @@ class MCPClient {
   }
 
   async cleanup() {
+    if (this.isRec) {
+      await this.stopRecording();
+    }
     await this.mcp.close();
+
+    if (fs.existsSync(this.tempAudioFile)) {
+      fs.unlinkSync(this.tempAudioFile);
+    }
   }
 
 }
@@ -157,6 +300,8 @@ async function main() {
   try {
     await mcpClient.connectToServer(process.argv[2]);
     await mcpClient.chatLoop();
+  } catch(error) {
+    console.error("Error in MCP Client: ", error)
   } finally {
     await mcpClient.cleanup();
     process.exit(0);
